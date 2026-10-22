@@ -272,6 +272,7 @@ input,textarea,select { font-family:inherit; }
 .upload-item-icon { width:32px; height:32px; border-radius:8px; background:var(--surface); display:flex; align-items:center; justify-content:center; color:var(--primary); font-size:14px; flex-shrink:0; }
 .upload-item-info { flex:1; min-width:0; }
 .upload-item-name { font-size:12px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-bottom:4px; }
+.upload-speed { font-size:10px; color:var(--muted); font-weight:500; margin-left:4px; }
 .progress-bar { width:100%; height:4px; background:var(--surface); border-radius:8px; overflow:hidden; }
 .progress-fill { height:100%; width:0%; border-radius:8px; background:linear-gradient(90deg,var(--primary),var(--accent)); transition:width .2s; }
 .upload-item-status { width:24px; height:24px; display:flex; align-items:center; justify-content:center; font-size:14px; flex-shrink:0; }
@@ -618,12 +619,13 @@ const CONFIG = {
 };
 
 /* ============================================================
-   BATAS UPLOAD — DIUBAH DARI 25MB MENJADI 300MB
+   BATAS UPLOAD — 300MB
    ============================================================ */
 const MAX_UPLOAD_SIZE = 300 * 1024 * 1024;       // 300 MB
 const MAX_UPLOAD_SIZE_LABEL = '300MB';
 const UPLOAD_XHR_TIMEOUT = 600000;                // 10 menit untuk file besar
-const UPLOAD_POLL_ATTEMPTS = 200;                 // ~300 detik polling token
+const UPLOAD_POLL_ATTEMPTS = 300;                 // ~10 menit polling maks
+const FETCH_THRESHOLD = 5 * 1024 * 1024;          // <=5MB: coba fetch dulu, >5MB: langsung XHR
 
 /* SAFE STORAGE */
 const Store = {
@@ -1563,7 +1565,6 @@ function createDocument() {
 function openDocument(id) {
   const d = state.documents.find(x => x.id === id);
   if (!d) return;
-  // Jika hanya file (tanpa konten dokumen) → buka Google Drive viewer
   if (d.file_url && !d.content) {
     openDocFile(id);
     return;
@@ -1953,8 +1954,17 @@ async function confirmMove() {
 }
 
 /* ============================================================
-   UPLOAD — BATAS MAKSIMAL 300MB
+   UPLOAD CEPAT — 300MB, prefetch pipeline, polling adaptif
    ============================================================ */
+
+/* Format kecepatan byte/detik ke string ramah */
+function formatSpeed(bps) {
+  if (!isFinite(bps) || bps <= 0) return '';
+  if (bps < 1024) return bps.toFixed(0) + ' B/s';
+  if (bps < 1024 * 1024) return (bps / 1024).toFixed(1) + ' KB/s';
+  return (bps / 1024 / 1024).toFixed(2) + ' MB/s';
+}
+
 function uploadFile() {
   if (state.user.role === 'viewer') return toast('Anda hanya bisa melihat','warning');
   const inp = document.createElement('input');
@@ -1962,8 +1972,8 @@ function uploadFile() {
   inp.onchange = () => { if (inp.files.length) doUploadMultiple(Array.from(inp.files)); };
   inp.click();
 }
+
 async function doUploadMultiple(files) {
-  // ==== BATAS MAKSIMAL 300MB PER FILE ====
   const MAX_SIZE = MAX_UPLOAD_SIZE;
   const valid = files.filter(f => {
     if (f.size > MAX_SIZE) {
@@ -1976,11 +1986,12 @@ async function doUploadMultiple(files) {
 
   uploadState.files = valid.map(f => ({ file: f, id: uid(), status: 'pending', progress: 0 }));
   uploadState.cancelled = false;
+
   document.getElementById('upload-list').innerHTML = uploadState.files.map(u => `
     <div class="upload-item" id="up-${u.id}">
       <div class="upload-item-icon"><i class="fa ${iconFor(u.file.type, u.file.name)}"></i></div>
       <div class="upload-item-info">
-        <div class="upload-item-name">${esc(u.file.name)}</div>
+        <div class="upload-item-name">${esc(u.file.name)}<span class="upload-speed" id="sp-${u.id}"></span></div>
         <div class="progress-bar"><div class="progress-fill" id="pf-${u.id}"></div></div>
       </div>
       <div class="upload-item-status uploading" id="st-${u.id}"><i class="fa fa-clock"></i></div>
@@ -1990,24 +2001,54 @@ async function doUploadMultiple(files) {
   document.getElementById('upload-cancel-btn').style.display = '';
   updateUploadTitle();
 
-  // Untuk file besar, kurangi konkurensi agar tidak membebani memori & jaringan
-  const CONCURRENCY = 2;
+  /* === PREFETCH PIPELINE ===
+     Konversi base64 file berikutnya dimulai selagi file saat ini diupload.
+     Sangat mempercepat multi-file upload (CPU-bound tidak lagi jadi bottleneck serial). */
+  const PREFETCH_MAX_SIZE = 50 * 1024 * 1024;
+  let prefetchIdx = 0;
+  function tryPrefetch() {
+    while (prefetchIdx < uploadState.files.length && !uploadState.cancelled) {
+      const it = uploadState.files[prefetchIdx];
+      prefetchIdx++;
+      if (it.base64Promise || it.base64) continue;
+      if (it.file.size > PREFETCH_MAX_SIZE) continue;
+      const needsCompression = it.file.type.startsWith('image/') &&
+                               it.file.size > 500 * 1024 &&
+                               it.file.size < 20 * 1024 * 1024;
+      if (needsCompression) continue;
+      it.base64Promise = readAsBase64(it.file).catch(e => { console.warn('Prefetch err:', e); return null; });
+      break;
+    }
+  }
+  tryPrefetch();
+  tryPrefetch();
+
+  /* === KONKURENSI DINAMIS === */
+  const totalSize = uploadState.files.reduce((s, f) => s + f.file.size, 0);
+  const hasHuge = uploadState.files.some(f => f.file.size > 100 * 1024 * 1024);
+  const CONCURRENCY = hasHuge ? 1 : (totalSize < 50 * 1024 * 1024 ? 4 : 2);
+
   const queue = [...uploadState.files];
   let done = 0, failed = 0;
+
   async function worker() {
     while (queue.length && !uploadState.cancelled) {
       const item = queue.shift();
       if (!item) break;
-      try { await uploadOne(item); done++; }
-      catch (e) {
+      try {
+        await uploadOne(item);
+        done++;
+      } catch (e) {
         failed++; item.status = 'error';
         const st = document.getElementById('st-' + item.id);
         if (st) { st.className = 'upload-item-status error'; st.innerHTML = '<i class="fa fa-exclamation-circle"></i>'; st.title = e.message; }
       }
+      tryPrefetch();
       updateUploadTitle(done, failed);
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, uploadState.files.length) }, worker));
+
   if (!uploadState.cancelled) {
     await loadDocuments();
     if (state.view === 'files') renderContent();
@@ -2020,29 +2061,60 @@ async function doUploadMultiple(files) {
     }, 900);
   }
 }
+
 function updateUploadTitle(done = 0, failed = 0) {
   const total = uploadState.files.length;
   const completed = done + failed;
   document.getElementById('upload-title').textContent = uploadState.cancelled ? 'Dibatalkan' : `Mengunggah ${total} file...`;
   document.getElementById('upload-subtitle').textContent = `${completed} dari ${total} selesai${failed?` · ${failed} gagal`:''}`;
 }
+
 async function uploadOne(item) {
   if (uploadState.cancelled) throw new Error('Dibatalkan');
   const st = document.getElementById('st-' + item.id);
   const pf = document.getElementById('pf-' + item.id);
+  const sp = document.getElementById('sp-' + item.id);
   st.className = 'upload-item-status uploading';
   st.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
+
   let file = item.file;
-  // Kompresi hanya untuk gambar di bawah 20MB (gambar raksasa > 20MB dilewati agar tidak crash)
   if (file.type.startsWith('image/') && file.size > 500 * 1024 && file.size < 20 * 1024 * 1024) {
     try { const c = await compressImage(file); if (c.size < file.size) file = c; } catch {}
   }
-  const base64 = await readAsBase64(file);
+
+  /* Ambil base64 dari prefetch jika tersedia */
+  let base64 = null;
+  if (item.base64Promise) {
+    try { base64 = await item.base64Promise; } catch {}
+    item.base64Promise = null;
+  }
+  if (!base64 && item.base64) {
+    base64 = item.base64;
+    item.base64 = null;
+  }
+  if (!base64) {
+    base64 = await readAsBase64(file);
+  }
+
+  /* Speed tracking */
+  let lastTime = Date.now();
+  let lastPct = 0;
+
   const result = await uploadToGAS(file.name, file.type || 'application/octet-stream', base64, (pct) => {
     if (pf) pf.style.width = pct + '%';
     if (uploadState.cancelled) throw new Error('Dibatalkan');
+    const now = Date.now();
+    if (sp && now - lastTime >= 500) {
+      const dt = (now - lastTime) / 1000;
+      const dpct = pct - lastPct;
+      const speed = ((dpct / 100) * file.size) / dt;
+      if (speed > 0) sp.textContent = ' · ' + formatSpeed(speed);
+      lastTime = now;
+      lastPct = pct;
+    }
   });
   if (!result || !result.success || !result.fileId) throw new Error(result?.error || 'Gagal upload ke Drive');
+
   const { error } = await sb.from('documents').insert({
     title: item.file.name, file_url: result.directUrl, file_name: item.file.name,
     file_type: item.file.type, file_size: file.size, drive_file_id: result.fileId,
@@ -2052,7 +2124,9 @@ async function uploadOne(item) {
   item.status = 'done';
   if (st) { st.className = 'upload-item-status done'; st.innerHTML = '<i class="fa fa-check-circle"></i>'; }
   if (pf) pf.style.width = '100%';
+  if (sp) sp.textContent = '';
 }
+
 function cancelUploads() {
   uploadState.cancelled = true;
   uploadState.files.forEach(u => {
@@ -2065,6 +2139,7 @@ function cancelUploads() {
   document.getElementById('upload-cancel-btn').style.display = 'none';
   setTimeout(() => document.getElementById('upload-overlay').classList.add('hidden'), 800);
 }
+
 function readAsBase64(file) {
   return new Promise((res, rej) => {
     const r = new FileReader();
@@ -2073,6 +2148,7 @@ function readAsBase64(file) {
     r.readAsDataURL(file);
   });
 }
+
 async function compressImage(file) {
   if (!file.type.startsWith('image/') || file.size < 500 * 1024) return file;
   if (file.type === 'image/svg+xml' || file.type === 'image/gif') return file;
@@ -2100,33 +2176,59 @@ async function compressImage(file) {
     img.src = url;
   });
 }
+
 async function uploadToGAS(fileName, mimeType, base64, onProgress) {
   const token = uid();
   const payload = JSON.stringify({ action: 'upload', fileName, mimeType, fileData: base64, token });
-  try {
-    onProgress(5);
-    const res = await fetch(CONFIG.GAS_URL, { method: 'POST', redirect: 'follow', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: payload });
-    if (res.ok) {
-      const data = JSON.parse(await res.text());
-      if (data.success && data.fileId) { onProgress(100); return data; }
-    }
-  } catch (e) { console.warn('Fetch CORS gagal, fallback no-cors:', e.message); }
+  const approxBytes = Math.floor(base64.length * 3 / 4);
+  const isLarge = approxBytes > FETCH_THRESHOLD;
+
+  /* ==== OPTIMASI KUNCI ====
+     Untuk file besar (>5MB), JANGAN coba fetch dulu — karena CORS GAS
+     biasanya memblokir respons POST. Hasilnya: upload dobel (fetch + XHR)
+     yang memakan 2x waktu. Langsung pakai XHR saja. */
+  if (!isLarge) {
+    try {
+      onProgress(5);
+      const res = await fetch(CONFIG.GAS_URL, {
+        method: 'POST', redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: payload
+      });
+      if (res.ok) {
+        const data = JSON.parse(await res.text());
+        if (data.success && data.fileId) { onProgress(100); return data; }
+      }
+    } catch (e) { console.warn('Fetch gagal, fallback XHR:', e.message); }
+  } else {
+    onProgress(3);
+  }
+
+  /* ==== XHR dengan progres (jalur utama untuk file besar) ==== */
   await new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', CONFIG.GAS_URL, true);
     try { xhr.setRequestHeader('Content-Type', 'text/plain;charset=utf-8'); } catch {}
-    // Timeout dinaikkan ke 10 menit agar file besar (300MB) tidak putus
     xhr.timeout = UPLOAD_XHR_TIMEOUT;
-    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(Math.min(90, Math.round((e.loaded / e.total) * 90))); };
-    xhr.onload = () => resolve(); xhr.onerror = () => resolve(); xhr.ontimeout = () => resolve();
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.min(90, Math.round((e.loaded / e.total) * 90)));
+    };
+    xhr.onload = () => resolve();
+    xhr.onerror = () => resolve();
+    xhr.ontimeout = () => resolve();
     xhr.onabort = () => reject(new Error('Upload dibatalkan'));
     try { xhr.send(payload); } catch (e) { reject(new Error('XHR gagal: ' + e.message)); }
   });
   onProgress(92);
-  // Polling diperpanjang agar file besar punya waktu lebih untuk diproses di Drive
+
+  /* ==== Polling adaptif: mulai 500ms, naik bertahap ==== */
+  let waitMs = 500;
   for (let i = 0; i < UPLOAD_POLL_ATTEMPTS; i++) {
     if (uploadState.cancelled) throw new Error('Dibatalkan');
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, waitMs));
+    if (i === 10) waitMs = 1000;
+    if (i === 25) waitMs = 2000;
+    if (i === 60) waitMs = 3000;
     try {
       const url = `${CONFIG.GAS_URL}?action=getByToken&token=${encodeURIComponent(token)}&t=${Date.now()}`;
       const r = await fetch(url, { redirect: 'follow', cache: 'no-store' });
@@ -2137,11 +2239,13 @@ async function uploadToGAS(fileName, mimeType, base64, onProgress) {
   }
   throw new Error('Timeout — file mungkin sudah terupload tapi respons tidak diterima.');
 }
+
 async function deleteFromGAS(fileId) {
   const url = `${CONFIG.GAS_URL}?action=delete&fileId=${encodeURIComponent(fileId)}&t=${Date.now()}`;
   try { const res = await fetch(url, { redirect: 'follow', cache: 'no-store' }); return await res.json(); }
   catch (e) { return { success: false, error: e.message }; }
 }
+
 async function testGASConnection() {
   toast('Menguji koneksi ke Google Apps Script...', 'info');
   try {
