@@ -617,6 +617,14 @@ const CONFIG = {
   GAS_URL: 'https://script.google.com/macros/s/AKfycbzph-TLm-4LWE9_qU0yIT8g6HGq4H1lIIwZsNeLMYjjN0L0bQJHh_vMYX6R_4D88w/exec'
 };
 
+/* ============================================================
+   BATAS UPLOAD — DIUBAH DARI 25MB MENJADI 300MB
+   ============================================================ */
+const MAX_UPLOAD_SIZE = 300 * 1024 * 1024;       // 300 MB
+const MAX_UPLOAD_SIZE_LABEL = '300MB';
+const UPLOAD_XHR_TIMEOUT = 600000;                // 10 menit untuk file besar
+const UPLOAD_POLL_ATTEMPTS = 200;                 // ~300 detik polling token
+
 /* SAFE STORAGE */
 const Store = {
   mem: {},
@@ -1944,7 +1952,9 @@ async function confirmMove() {
   toast(`${success} item dipindahkan${failed?`, ${failed} gagal`:''}`, failed ? 'warning' : 'success');
 }
 
-/* UPLOAD */
+/* ============================================================
+   UPLOAD — BATAS MAKSIMAL 300MB
+   ============================================================ */
 function uploadFile() {
   if (state.user.role === 'viewer') return toast('Anda hanya bisa melihat','warning');
   const inp = document.createElement('input');
@@ -1953,9 +1963,17 @@ function uploadFile() {
   inp.click();
 }
 async function doUploadMultiple(files) {
-  const MAX_SIZE = 25 * 1024 * 1024;
-  const valid = files.filter(f => { if (f.size > MAX_SIZE) { toast(`"${f.name}" terlalu besar (maks 25MB)`, 'error'); return false; } return true; });
+  // ==== BATAS MAKSIMAL 300MB PER FILE ====
+  const MAX_SIZE = MAX_UPLOAD_SIZE;
+  const valid = files.filter(f => {
+    if (f.size > MAX_SIZE) {
+      toast(`"${f.name}" terlalu besar (maks ${MAX_UPLOAD_SIZE_LABEL})`, 'error');
+      return false;
+    }
+    return true;
+  });
   if (!valid.length) return;
+
   uploadState.files = valid.map(f => ({ file: f, id: uid(), status: 'pending', progress: 0 }));
   uploadState.cancelled = false;
   document.getElementById('upload-list').innerHTML = uploadState.files.map(u => `
@@ -1971,7 +1989,9 @@ async function doUploadMultiple(files) {
   document.getElementById('upload-overlay').classList.remove('hidden');
   document.getElementById('upload-cancel-btn').style.display = '';
   updateUploadTitle();
-  const CONCURRENCY = 3;
+
+  // Untuk file besar, kurangi konkurensi agar tidak membebani memori & jaringan
+  const CONCURRENCY = 2;
   const queue = [...uploadState.files];
   let done = 0, failed = 0;
   async function worker() {
@@ -2013,7 +2033,8 @@ async function uploadOne(item) {
   st.className = 'upload-item-status uploading';
   st.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
   let file = item.file;
-  if (file.type.startsWith('image/') && file.size > 500 * 1024) {
+  // Kompresi hanya untuk gambar di bawah 20MB (gambar raksasa > 20MB dilewati agar tidak crash)
+  if (file.type.startsWith('image/') && file.size > 500 * 1024 && file.size < 20 * 1024 * 1024) {
     try { const c = await compressImage(file); if (c.size < file.size) file = c; } catch {}
   }
   const base64 = await readAsBase64(file);
@@ -2094,14 +2115,16 @@ async function uploadToGAS(fileName, mimeType, base64, onProgress) {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', CONFIG.GAS_URL, true);
     try { xhr.setRequestHeader('Content-Type', 'text/plain;charset=utf-8'); } catch {}
-    xhr.timeout = 120000;
+    // Timeout dinaikkan ke 10 menit agar file besar (300MB) tidak putus
+    xhr.timeout = UPLOAD_XHR_TIMEOUT;
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(Math.min(90, Math.round((e.loaded / e.total) * 90))); };
     xhr.onload = () => resolve(); xhr.onerror = () => resolve(); xhr.ontimeout = () => resolve();
     xhr.onabort = () => reject(new Error('Upload dibatalkan'));
     try { xhr.send(payload); } catch (e) { reject(new Error('XHR gagal: ' + e.message)); }
   });
   onProgress(92);
-  for (let i = 0; i < 40; i++) {
+  // Polling diperpanjang agar file besar punya waktu lebih untuk diproses di Drive
+  for (let i = 0; i < UPLOAD_POLL_ATTEMPTS; i++) {
     if (uploadState.cancelled) throw new Error('Dibatalkan');
     await new Promise(r => setTimeout(r, 1500));
     try {
